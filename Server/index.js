@@ -6,12 +6,8 @@ import { pool } from './db.js'
 const app = express()
 app.use(express.json())
 
-// CORS: allow local React dev + (later) your deployed frontend
 app.use(cors({
-  origin: [
-    'http://localhost:5173', // Vite default
-    'http://localhost:3000'  // CRA default (just in case)
-  ],
+  origin: ['http://localhost:5173','http://localhost:3000'],
   credentials: false
 }))
 
@@ -21,7 +17,8 @@ const mapInvoiceRow = r => ({
   supplier: r.supplier,
   hub: r.hub,
   type: r.type,
-  invoice_date: r.invoice_date,     // your UI formats to UK date
+  invoiceno: r.invoiceno,
+  invoice_date: r.invoice_date,
   po: r.po,
   folder: r.folder,
   assigned: r.assigned,
@@ -29,10 +26,10 @@ const mapInvoiceRow = r => ({
   last_modified: r.last_modified,
   created_on: r.created_on,
   status: r.status,
-  notes: r.notes || []              // array of {id, text, date}
+  notes: r.notes || []
 })
 
-// GET /api/invoices  -> returns invoices with notes[] (to match your UI)
+// GET /api/invoices
 app.get('/api/invoices', async (_req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -57,7 +54,7 @@ app.get('/api/invoices', async (_req, res) => {
 // POST /api/invoices/:id/notes
 app.post('/api/invoices/:id/notes', async (req, res) => {
   const { id } = req.params
-  const { text, date } = req.body   // date optional; default today in DB
+  const { text, date } = req.body
   if (!text) return res.status(400).json({ error: 'text is required' })
   try {
     const { rows } = await pool.query(
@@ -97,15 +94,59 @@ app.put('/api/invoices/:id/notes/:noteId', async (req, res) => {
 app.delete('/api/invoices/:id/notes/:noteId', async (req, res) => {
   const { noteId } = req.params
   try {
-    const { rowCount } = await pool.query(
-      `DELETE FROM note WHERE id = $1`,
-      [noteId]
-    )
+    const { rowCount } = await pool.query(`DELETE FROM note WHERE id = $1`, [noteId])
     if (!rowCount) return res.status(404).json({ error: 'Note not found' })
     res.status(204).send()
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'Failed to delete note' })
+  }
+})
+
+/**
+ * PATCH /api/invoices/:id
+ * Accepts subset of fields: { status, folder, assigned, ref }
+ * Validates status in ('New','Matched','Posting','Completed')
+ * Sets last_modified = now()
+ */
+app.patch('/api/invoices/:id', async (req, res) => {
+  const { id } = req.params
+  const allowed = ['status', 'folder', 'assigned', 'ref']
+  const patch = {}
+  for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
+
+  // nothing to update
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: 'No updatable fields supplied' })
+  }
+
+  // validate status
+  if (patch.status && !['New','Matched','Posting','Completed'].includes(patch.status)) {
+    return res.status(400).json({ error: 'Invalid status' })
+  }
+
+  // build dynamic SET clause
+  const sets = []
+  const vals = []
+  let idx = 1
+  for (const [k, v] of Object.entries(patch)) {
+    sets.push(`${k} = $${idx++}`)
+    vals.push(v)
+  }
+  // always touch last_modified
+  sets.push(`last_modified = now()`)
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE invoice SET ${sets.join(', ')} WHERE id = $${idx}
+       RETURNING *`,
+      [...vals, id]
+    )
+    if (!rows[0]) return res.status(404).json({ error: 'Invoice not found' })
+    res.json(mapInvoiceRow({ ...rows[0], notes: [] })) // notes not joined here
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'Failed to update invoice' })
   }
 })
 
