@@ -15,12 +15,18 @@ import {
   TextField,
   Button,
   Snackbar,
-  Slide,
+  Select,
+  MenuItem,
 } from "@mui/material";
 import { DataGrid, GridToolbarQuickFilter } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
 import DeleteIcon from "@mui/icons-material/Delete";
 import CloseIcon from "@mui/icons-material/Close";
+
+// Use env-driven API base; falls back to localhost for dev
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000";
+
+const STATUS_OPTIONS = ["New", "Matched", "Posting", "Completed"];
 
 const formatUKDate = (isoString) => {
   if (!isoString) return "";
@@ -30,34 +36,6 @@ const formatUKDate = (isoString) => {
   const year = String(date.getFullYear()).slice(-2);
   return `${day}-${month}-${year}`;
 };
-
-const columns = [
-  { field: "supplier", headerName: "Supplier", flex: 1 },
-  { field: "hub", headerName: "Hub", flex: 1 },
-  { field: "type", headerName: "Type", flex: 1 },
-  {
-    field: "invoice_date",
-    headerName: "Invoice Date",
-    flex: 1,
-    valueGetter: (params) => formatUKDate(params.row.invoice_date),
-  },
-  { field: "po", headerName: "PO", flex: 1 },
-  { field: "folder", headerName: "Folder", flex: 1 },
-  { field: "assigned", headerName: "Assigned", flex: 1 },
-  { field: "ref", headerName: "Ref", flex: 1 },
-  {
-    field: "last_modified",
-    headerName: "Last Modified",
-    flex: 1,
-    valueGetter: (params) => formatUKDate(params.row.last_modified),
-  },
-  {
-    field: "created_on",
-    headerName: "Created On",
-    flex: 1,
-    valueGetter: (params) => formatUKDate(params.row.created_on),
-  },
-];
 
 function QuickSearchToolbar() {
   return (
@@ -70,10 +48,16 @@ function QuickSearchToolbar() {
 function InvoiceDashboard() {
   const [rows, setRows] = useState([]);
   const [filterSupplier, setFilterSupplier] = useState(null);
+
   const [selectedRow, setSelectedRow] = useState(null);
+  const [rowSelectionModel, setRowSelectionModel] = useState([]);
+
   const [selectedNote, setSelectedNote] = useState(null);
   const [noteDialogOpen, setNoteDialogOpen] = useState(false);
   const [noteText, setNoteText] = useState("");
+
+  // New: status filter (header dropdown)
+  const [statusFilter, setStatusFilter] = useState("All");
 
   // --- New items pop-up state ---
   const [newItemsCount, setNewItemsCount] = useState(0);
@@ -85,7 +69,7 @@ function InvoiceDashboard() {
   useEffect(() => {
     const fetchInvoices = async () => {
       try {
-        const res = await fetch("http://localhost:5000/api/invoices");
+        const res = await fetch(`${API_BASE}/api/invoices`);
         const data = await res.json();
 
         const prevIds = prevIdsRef.current;
@@ -128,6 +112,28 @@ function InvoiceDashboard() {
     return () => clearInterval(interval);
   }, []);
 
+  // ------------------- Keep selectedRow in sync with rows -----------
+  const filteredRows = useMemo(() => {
+    let base = filterSupplier ? rows.filter((r) => r.supplier === filterSupplier) : rows;
+
+    // Apply Status filter (treat missing as 'New')
+    if (statusFilter !== "All") {
+      base = base.filter((r) => (r.status || "New") === statusFilter);
+    }
+    return base;
+  }, [rows, filterSupplier, statusFilter]);
+
+  useEffect(() => {
+    if (rowSelectionModel.length === 0) {
+      setSelectedRow(null);
+      return;
+    }
+    const id = rowSelectionModel[0];
+    const source = filterSupplier ? filteredRows : rows;
+    const match = source.find((r) => r.id === id) || null;
+    setSelectedRow(match);
+  }, [rows, filteredRows, filterSupplier, rowSelectionModel]);
+
   // ------------------- Notes Handlers -------------------
   const handleOpenNote = (note) => {
     if (!selectedRow) return;
@@ -141,51 +147,52 @@ function InvoiceDashboard() {
     const invoiceId = selectedRow.id;
 
     if (selectedNote) {
+      // UPDATE existing
       try {
         const res = await fetch(
-          `http://localhost:5000/api/invoices/${invoiceId}/notes/${selectedNote.id}`,
+          `${API_BASE}/api/invoices/${invoiceId}/notes/${selectedNote.id}`,
           {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text: noteText }),
+            body: JSON.stringify({ text: noteText, supplier: selectedRow.supplier }),
           }
         );
         const updatedNote = await res.json();
-        setRows((prev) =>
-          prev.map((r) =>
-            r.id === invoiceId
-              ? {
-                  ...r,
-                  notes: r.notes.map((n) =>
-                    n.id === updatedNote.id ? updatedNote : n
-                  ),
-                }
-              : r
-          )
-        );
+
+        const updatedRow = {
+          ...selectedRow,
+          notes: (Array.isArray(selectedRow.notes) ? selectedRow.notes : []).map((n) =>
+            n.id === updatedNote.id ? updatedNote : n
+          ),
+        };
+
+        setRows((prev) => prev.map((r) => (r.id === invoiceId ? updatedRow : r)));
+        setSelectedRow(updatedRow);
       } catch (err) {
         console.error(err);
       }
     } else {
+      // CREATE new
       try {
         const newNotePayload = {
           text: noteText,
           date: new Date().toISOString().split("T")[0],
+          supplier: selectedRow.supplier,
         };
-        const res = await fetch(
-          `http://localhost:5000/api/invoices/${invoiceId}/notes`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(newNotePayload),
-          }
-        );
+        const res = await fetch(`${API_BASE}/api/invoices/${invoiceId}/notes`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(newNotePayload),
+        });
         const savedNote = await res.json();
-        setRows((prev) =>
-          prev.map((r) =>
-            r.id === invoiceId ? { ...r, notes: [...r.notes, savedNote] } : r
-          )
-        );
+
+        const updatedRow = {
+          ...selectedRow,
+          notes: Array.isArray(selectedRow.notes) ? [...selectedRow.notes, savedNote] : [savedNote],
+        };
+
+        setRows((prev) => prev.map((r) => (r.id === invoiceId ? updatedRow : r)));
+        setSelectedRow(updatedRow);
       } catch (err) {
         console.error(err);
       }
@@ -202,17 +209,19 @@ function InvoiceDashboard() {
     if (!window.confirm("Are you sure you want to delete this note?")) return;
 
     try {
-      await fetch(
-        `http://localhost:5000/api/invoices/${invoiceId}/notes/${noteId}`,
-        { method: "DELETE" }
-      );
-      setRows((prev) =>
-        prev.map((r) =>
-          r.id === invoiceId
-            ? { ...r, notes: r.notes.filter((n) => n.id !== noteId) }
-            : r
-        )
-      );
+      await fetch(`${API_BASE}/api/invoices/${invoiceId}/notes/${noteId}`, {
+        method: "DELETE",
+      });
+
+      const updatedRow = {
+        ...selectedRow,
+        notes: (Array.isArray(selectedRow.notes) ? selectedRow.notes : []).filter(
+          (n) => n.id !== noteId
+        ),
+      };
+
+      setRows((prev) => prev.map((r) => (r.id === invoiceId ? updatedRow : r)));
+      setSelectedRow(updatedRow);
     } catch (err) {
       console.error(err);
     }
@@ -226,15 +235,78 @@ function InvoiceDashboard() {
     }, {});
   }, [rows]);
 
-  const filteredRows = useMemo(() => {
-    return filterSupplier
-      ? rows.filter((r) => r.supplier === filterSupplier)
-      : rows;
-  }, [rows, filterSupplier]);
-
   const handleSupplierClick = (supplier) => {
     setFilterSupplier(supplier);
   };
+
+  // ------------------- Columns (with Status + header filter) --------
+  const columns = useMemo(
+    () => [
+      {
+        field: "supplier",
+        headerName: "Supplier",
+        flex: 1,
+      },
+      { field: "hub", headerName: "Hub", flex: 1 },
+      { field: "type", headerName: "Type", flex: 1 },
+      {
+        field: "status",
+        headerName: "Status",
+        flex: 1,
+        // Display 'New' if missing
+        valueGetter: (params) => params.row.status || "New",
+        // Header with dropdown filter
+        renderHeader: () => (
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="caption" sx={{ fontWeight: 600 }}>
+              Status
+            </Typography>
+            <Select
+              size="small"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              displayEmpty
+              sx={{
+                fontSize: 12,
+                height: 26,
+                "& .MuiSelect-select": { py: 0.2, minHeight: 0 },
+              }}
+            >
+              <MenuItem value="All">All</MenuItem>
+              {STATUS_OPTIONS.map((s) => (
+                <MenuItem key={s} value={s}>
+                  {s}
+                </MenuItem>
+              ))}
+            </Select>
+          </Box>
+        ),
+      },
+      {
+        field: "invoice_date",
+        headerName: "Invoice Date",
+        flex: 1,
+        valueGetter: (params) => formatUKDate(params.row.invoice_date),
+      },
+      { field: "po", headerName: "PO", flex: 1 },
+      { field: "folder", headerName: "Folder", flex: 1 },
+      { field: "assigned", headerName: "Assigned", flex: 1 },
+      { field: "ref", headerName: "Ref", flex: 1 },
+      {
+        field: "last_modified",
+        headerName: "Last Modified",
+        flex: 1,
+        valueGetter: (params) => formatUKDate(params.row.last_modified),
+      },
+      {
+        field: "created_on",
+        headerName: "Created On",
+        flex: 1,
+        valueGetter: (params) => formatUKDate(params.row.created_on),
+      },
+    ],
+    [statusFilter]
+  );
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", height: "100vh" }}>
@@ -247,20 +319,27 @@ function InvoiceDashboard() {
         <DataGrid
           rows={filteredRows}
           columns={columns}
-          rowHeight={14}
-          headerHeight={20}
+          rowHeight={30}
+          headerHeight={28}
+          density="compact"
           checkboxSelection
           disableRowSelectionOnClick
-          onRowSelectionModelChange={(selection) => {
-            const id = selection[0] || null;
-            setSelectedRow(rows.find((r) => r.id === id) || null);
+          rowSelectionModel={rowSelectionModel}
+          onRowSelectionModelChange={(newModel) => {
+            setRowSelectionModel(newModel);
           }}
-          selectionModel={selectedRow ? [selectedRow.id] : []}
+          // Clicking supplier cell should select row AND tick the checkbox
+          onCellClick={(params) => {
+            if (params.field === "supplier") {
+              setRowSelectionModel([params.id]);
+              setSelectedRow(params.row);
+            }
+          }}
           slots={{ toolbar: QuickSearchToolbar }}
           sx={{
-            fontSize: 10,
+            fontSize: 13,
             "& .MuiDataGrid-columnHeaders": {
-              fontSize: 10,
+              fontSize: 12,
               color: "#68adf1ff",
             },
             "& .MuiDataGrid-cell": {
@@ -287,7 +366,7 @@ function InvoiceDashboard() {
 
       <Box sx={{ display: "flex", mt: 1, flexShrink: 0 }}>
         {/* Suppliers Panel */}
-        <Card sx={{ flex: 1, mr: 1, height: "160px", position: "relative" }}>
+        <Card sx={{ flex: 1, mr: 1, height: "320px", position: "relative" }}>
           {/* Sticky header */}
           <Box
             display="flex"
@@ -302,12 +381,12 @@ function InvoiceDashboard() {
               pb: 0.5,
             }}
           >
-            <Typography variant="body2" sx={{ fontSize: 10 }}>
+            <Typography variant="body2" sx={{ fontSize: 14 }}>
               Suppliers
             </Typography>
             <Button
               size="small"
-              sx={{ fontSize: 10, textTransform: "none" }}
+              sx={{ fontSize: 14, textTransform: "none" }}
               onClick={() => setFilterSupplier(null)}
             >
               Show All
@@ -335,7 +414,7 @@ function InvoiceDashboard() {
         </Card>
 
         {/* Notes Panel */}
-        <Card sx={{ flex: 2, height: "160px" }}>
+        <Card sx={{ flex: 2, height: "320px" }}>
           <CardContent sx={{ p: 1, height: "100%", overflowY: "auto" }}>
             <Box
               display="flex"
@@ -343,12 +422,12 @@ function InvoiceDashboard() {
               alignItems="center"
               mb={0.5}
             >
-              <Typography variant="body2" sx={{ fontSize: 10 }}>
+              <Typography variant="body2" sx={{ fontSize: 14 }}>
                 Notes
               </Typography>
               <Button
                 size="small"
-                sx={{ fontSize: 10, textTransform: "none" }}
+                sx={{ fontSize: 14, textTransform: "none" }}
                 onClick={() => {
                   setSelectedNote(null);
                   setNoteText("");
@@ -359,7 +438,7 @@ function InvoiceDashboard() {
               </Button>
             </Box>
             <List dense>
-              {selectedRow && selectedRow.notes.length > 0 ? (
+              {selectedRow && Array.isArray(selectedRow.notes) && selectedRow.notes.length > 0 ? (
                 selectedRow.notes.map((note) => (
                   <ListItem
                     key={note.id}
@@ -428,23 +507,21 @@ function InvoiceDashboard() {
 
       {/* New Items Pop-up */}
       <Snackbar
-  open={snackbarOpen}
-  anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
-  autoHideDuration={4000}
-  onClose={() => setSnackbarOpen(false)}
-  message={`${newItemsCount} new item(s) added`}
-  ContentProps={{
-    sx: {
-      backgroundColor: "#1976d2", // blue
-      color: "#fff",
-      fontSize: 10,
-      width: 250,                 // sets width in pixels
-      maxWidth: "100%",           // ensures it doesn’t overflow
-    },
-  }}
-/>
-
-
+        open={snackbarOpen}
+        anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+        autoHideDuration={4000}
+        onClose={() => setSnackbarOpen(false)}
+        message={`${newItemsCount} new item(s) added`}
+        ContentProps={{
+          sx: {
+            backgroundColor: "#1976d2",
+            color: "#fff",
+            fontSize: 10,
+            width: 250,
+            maxWidth: "100%",
+          },
+        }}
+      />
 
       <style>{`
         .row-new-highlight {
