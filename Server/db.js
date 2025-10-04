@@ -12,3 +12,4 @@ export const pool = new Pool({
   ssl: { rejectUnauthorized: false },
   // In production, prefer a real CA bundle instead of disabling verification (see note below).
 });
+
