@@ -400,7 +400,6 @@ async function pollRepliesOnce() {
   try {
     await ensureReplySchema()
 
-    // Make sure we actually have a token before proceeding
     const token = await getGraphToken()
     if (!token) {
       console.error('pollRepliesOnce error: no Graph token')
@@ -408,16 +407,13 @@ async function pollRepliesOnce() {
     }
     const headers = { Authorization: `Bearer ${token}` }
 
-    // Build a safe default URL via the URL API (so searchParams is always present)
+    // Build safe default URL
     const defaultUrl = new URL(
       `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(REPLY_MAILBOX)}/mailFolders('Inbox')/messages/delta`
     )
-    defaultUrl.searchParams.set(
-      '$select',
-      'subject,from,receivedDateTime,body,internetMessageId'
-    )
+    defaultUrl.searchParams.set('$select', 'subject,from,receivedDateTime,body,internetMessageId')
 
-    // Load the stored cursor and coerce to a valid URL
+    // Load cursor and coerce to URL
     let cursor = await loadDeltaLink(REPLY_MAILBOX)
     if (cursor && typeof cursor !== 'string') cursor = String(cursor)
 
@@ -425,7 +421,6 @@ async function pollRepliesOnce() {
     try {
       next = new URL(cursor || defaultUrl.toString())
     } catch {
-      // If the stored link is malformed, reset to the default start
       next = new URL(defaultUrl.toString())
     }
 
@@ -475,22 +470,7 @@ async function pollRepliesOnce() {
   }
 }
 
-// Only enable poller if config is complete
-const ENABLE_REPLY_POLLER =
-  !!REPLY_MAILBOX &&
-  !!process.env.GRAPH_TENANT_ID &&
-  !!process.env.GRAPH_CLIENT_ID &&
-  !!process.env.GRAPH_CLIENT_SECRET
-
-if (ENABLE_REPLY_POLLER) {
-  setInterval(pollRepliesOnce, 60_000)
-  pollRepliesOnce()
-} else {
-  console.log('Reply poller disabled: missing Graph config or REPLY_MAILBOX')
-}
-
-
-// Only enable poller if config is complete
+// Enable poller only if config is complete (define ONCE)
 const ENABLE_REPLY_POLLER =
   !!REPLY_MAILBOX &&
   !!process.env.GRAPH_TENANT_ID &&
@@ -506,7 +486,7 @@ if (ENABLE_REPLY_POLLER) {
 
 // ------------------------- Catch-all for React (Express 5-safe) -------------------------
 if (clientDir) {
-  // IMPORTANT: this is after API routes so it doesn't intercept /api/*
+  // after API routes so it doesn't intercept /api/*
   app.get(/^(?!\/api\/).*/, (_req, res) => {
     res.sendFile(path.join(clientDir, 'index.html'))
   })
