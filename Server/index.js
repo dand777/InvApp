@@ -352,7 +352,11 @@ app.patch('/api/invoices/:id', async (req, res) => {
 })
 
 // ------------------------- Reply ingestion poller -------------------------
-const REPLY_MAILBOX = (process.env.REPLY_MAILBOX || (process.env.SHARED_MAILBOXES || '').split(',')[0] || '').trim()
+const REPLY_MAILBOX =
+  (process.env.REPLY_MAILBOX ||
+    (process.env.SHARED_MAILBOXES || '').split(',')[0] ||
+    ''
+  ).trim()
 
 function extractInvoiceIdFromSubject(subject = '') {
   const m = subject.match(/\[#INV:(\d+)\]/i)
@@ -396,25 +400,44 @@ async function pollRepliesOnce() {
   try {
     await ensureReplySchema()
 
+    // Make sure we actually have a token before proceeding
     const token = await getGraphToken()
+    if (!token) {
+      console.error('pollRepliesOnce error: no Graph token')
+      return
+    }
     const headers = { Authorization: `Bearer ${token}` }
 
-    let deltaLink = await loadDeltaLink(REPLY_MAILBOX)
-    let url =
-      deltaLink ||
-      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(REPLY_MAILBOX)}` +
-        `/mailFolders('Inbox')/messages/delta` +
-        `?$select=subject,from,receivedDateTime,body,internetMessageId`
+    // Build a safe default URL via the URL API (so searchParams is always present)
+    const defaultUrl = new URL(
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(REPLY_MAILBOX)}/mailFolders('Inbox')/messages/delta`
+    )
+    defaultUrl.searchParams.set(
+      '$select',
+      'subject,from,receivedDateTime,body,internetMessageId'
+    )
 
-    while (url) {
-      const resp = await fetch(url, { headers })
+    // Load the stored cursor and coerce to a valid URL
+    let cursor = await loadDeltaLink(REPLY_MAILBOX)
+    if (cursor && typeof cursor !== 'string') cursor = String(cursor)
+
+    let next
+    try {
+      next = new URL(cursor || defaultUrl.toString())
+    } catch {
+      // If the stored link is malformed, reset to the default start
+      next = new URL(defaultUrl.toString())
+    }
+
+    while (next) {
+      const resp = await fetch(next.toString(), { headers })
       if (!resp.ok) {
         const text = await resp.text()
         throw new Error(`Graph delta failed ${resp.status}: ${text}`)
       }
       const json = await resp.json()
 
-      for (const m of json.value || []) {
+      for (const m of (json.value || [])) {
         const invoiceId = extractInvoiceIdFromSubject(m.subject || '')
         if (!invoiceId) continue
 
@@ -435,18 +458,37 @@ async function pollRepliesOnce() {
       }
 
       if (json['@odata.nextLink']) {
-        url = json['@odata.nextLink']
+        try {
+          next = new URL(String(json['@odata.nextLink']))
+        } catch {
+          next = null
+        }
       } else {
-        deltaLink = json['@odata.deltaLink'] || deltaLink
-        url = null
+        if (json['@odata.deltaLink']) {
+          await saveDeltaLink(REPLY_MAILBOX, String(json['@odata.deltaLink']))
+        }
+        next = null
       }
     }
-
-    if (deltaLink) await saveDeltaLink(REPLY_MAILBOX, deltaLink)
   } catch (e) {
-    console.error('pollRepliesOnce error:', e?.message || e)
+    console.error('pollRepliesOnce error:', e && e.message ? e.message : e)
   }
 }
+
+// Only enable poller if config is complete
+const ENABLE_REPLY_POLLER =
+  !!REPLY_MAILBOX &&
+  !!process.env.GRAPH_TENANT_ID &&
+  !!process.env.GRAPH_CLIENT_ID &&
+  !!process.env.GRAPH_CLIENT_SECRET
+
+if (ENABLE_REPLY_POLLER) {
+  setInterval(pollRepliesOnce, 60_000)
+  pollRepliesOnce()
+} else {
+  console.log('Reply poller disabled: missing Graph config or REPLY_MAILBOX')
+}
+
 
 // Only enable poller if config is complete
 const ENABLE_REPLY_POLLER =
