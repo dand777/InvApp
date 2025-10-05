@@ -5,20 +5,16 @@ import { pool } from './db.js'
 import multer from 'multer';
 import fetch from 'node-fetch';
 import { ClientSecretCredential } from '@azure/identity';
-
-// Tag outbound subjects with a stable token we can find in replies
-function withRefTag(subject, invoiceId) {
-  if (!invoiceId) return subject || '';
-  const tag = `[#INV:${invoiceId}]`;
-  return (subject || '').includes(tag) ? subject : `${subject || ''} ${tag}`.trim();
-}
-
-// 🔹 NEW: Azure Blob SAS helpers
+import path from 'path';
+import { fileURLToPath } from 'url';
 import {
   StorageSharedKeyCredential,
   BlobSASPermissions,
   generateBlobSASQueryParameters
 } from '@azure/storage-blob'
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express()
 const upload = multer({ limits: { fileSize: 8 * 1024 * 1024 } }); // 8 MB per file
@@ -30,7 +26,45 @@ app.use(cors({
   credentials: false
 }))
 
-// --- Microsoft Graph (Application permissions) ---
+// ------------------------- React Frontend -------------------------
+// Serve React static files
+app.use(express.static(path.join(__dirname, '../client/build')));
+
+// ------------------------------------------------------------------
+
+// Tag outbound subjects with a stable token we can find in replies
+function withRefTag(subject, invoiceId) {
+  if (!invoiceId) return subject || '';
+  const tag = `[#INV:${invoiceId}]`;
+  return (subject || '').includes(tag) ? subject : `${subject || ''} ${tag}`.trim();
+}
+
+// 🔹 Azure Blob SAS helpers
+const AZ_ACCOUNT   = process.env.AZURE_STORAGE_ACCOUNT
+const AZ_KEY       = process.env.AZURE_STORAGE_ACCOUNT_KEY
+const AZ_CONTAINER = process.env.AZURE_STORAGE_CONTAINER
+const AZ_BASE_DIR  = (process.env.AZURE_BLOB_BASE_DIR || '').replace(/^\/+|\/+$/g, '')
+
+const hasAzureCreds = Boolean(AZ_ACCOUNT && AZ_KEY && AZ_CONTAINER)
+const sharedKey = hasAzureCreds ? new StorageSharedKeyCredential(AZ_ACCOUNT, AZ_KEY) : null
+
+// Encode each path segment safely
+const encodePath = (p) =>
+  (p || '')
+    .split('/')
+    .filter(Boolean)
+    .map(s => encodeURIComponent(s))
+    .join('/')
+
+// Turn stored relative path into "<base_dir>/<relative>" if base dir is set
+function normalizeBlobPath(storedPath) {
+  const rel = String(storedPath || '').replace(/^\/+/, '')
+  if (!AZ_BASE_DIR) return rel
+  if (rel.toLowerCase().startsWith(AZ_BASE_DIR.toLowerCase() + '/')) return rel
+  return `${AZ_BASE_DIR}/${rel}`
+}
+
+// ------------------------- Microsoft Graph -------------------------
 const credential = new ClientSecretCredential(
   process.env.GRAPH_TENANT_ID,
   process.env.GRAPH_CLIENT_ID,
@@ -56,12 +90,11 @@ function allowedFromAddress(addr) {
     .split(',')
     .map(s => s.trim().toLowerCase())
     .filter(Boolean);
-  if (!allowed.length) return true;
+  if (!allowed.length) return true
   return allowed.includes(String(addr || '').toLowerCase());
 }
 
-
-// Helper: shape each invoice row and attach notes array
+// Helper: shape invoice row
 const mapInvoiceRow = r => ({
   id: r.id,
   supplier: r.supplier,
@@ -79,31 +112,7 @@ const mapInvoiceRow = r => ({
   notes: r.notes || []
 })
 
-// 🔹 NEW: Azure config + utilities
-const AZ_ACCOUNT   = process.env.AZURE_STORAGE_ACCOUNT
-const AZ_KEY       = process.env.AZURE_STORAGE_ACCOUNT_KEY
-const AZ_CONTAINER = process.env.AZURE_STORAGE_CONTAINER     // e.g. 'incoming'
-const AZ_BASE_DIR  = (process.env.AZURE_BLOB_BASE_DIR || '').replace(/^\/+|\/+$/g, '') // optional subfolder
-
-const hasAzureCreds = Boolean(AZ_ACCOUNT && AZ_KEY && AZ_CONTAINER)
-const sharedKey = hasAzureCreds ? new StorageSharedKeyCredential(AZ_ACCOUNT, AZ_KEY) : null
-
-// Encode each path segment safely
-const encodePath = (p) =>
-  (p || '')
-    .split('/')
-    .filter(Boolean)
-    .map(s => encodeURIComponent(s))
-    .join('/')
-
-// Turn stored relative path into "<base_dir>/<relative>" if base dir is set
-function normalizeBlobPath(storedPath) {
-  const rel = String(storedPath || '').replace(/^\/+/, '') // drop leading "/"
-  if (!AZ_BASE_DIR) return rel
-  // Prepend base dir if not already present
-  if (rel.toLowerCase().startsWith(AZ_BASE_DIR.toLowerCase() + '/')) return rel
-  return `${AZ_BASE_DIR}/${rel}`
-}
+// ------------------------- API Routes -------------------------
 
 // GET /api/invoices
 app.get('/api/invoices', async (_req, res) => {
@@ -190,19 +199,14 @@ app.delete('/api/invoices/:id', async (req, res) => {
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Invoice not found' });
     }
-    return res.status(204).send(); // No content
+    return res.status(204).send();
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: 'Failed to delete invoice' });
   }
 });
 
-/**
- * 🔹 NEW
- * GET /api/invoices/:id/blob-url
- * Builds a fresh 15-minute SAS URL from a RELATIVE path stored in invoice.bloburl
- * Response: { url }
- */
+// GET /api/invoices/:id/blob-url
 app.get('/api/invoices/:id/blob-url', async (req, res) => {
   const { id } = req.params
   try {
@@ -216,8 +220,6 @@ app.get('/api/invoices/:id/blob-url', async (req, res) => {
 
     const blobPath = normalizeBlobPath(row.bloburl)
 
-    // If we can't mint SAS (missing creds), return a best-effort absolute URL.
-    // This will only work if the container is public.
     if (!hasAzureCreds) {
       const bestEffortUrl =
         `https://${AZ_ACCOUNT}.blob.core.windows.net/` +
@@ -227,9 +229,8 @@ app.get('/api/invoices/:id/blob-url', async (req, res) => {
       return res.json({ url: bestEffortUrl })
     }
 
-    // Generate short-lived SAS (read-only)
-    const expiresOn = new Date(Date.now() + 15 * 60 * 1000) // 15 minutes
-    const startsOn  = new Date(Date.now() - 60 * 1000)      // allow 1 min clock skew
+    const expiresOn = new Date(Date.now() + 15 * 60 * 1000)
+    const startsOn  = new Date(Date.now() - 60 * 1000)
 
     const sas = generateBlobSASQueryParameters(
       {
@@ -255,25 +256,19 @@ app.get('/api/invoices/:id/blob-url', async (req, res) => {
   }
 })
 
-/**
- * POST /api/email/send
- * FormData: from, to, cc, bcc, subject, body, invoiceId, attachments[]
- */
+// POST /api/email/send
 app.post('/api/email/send', upload.array('attachments'), async (req, res) => {
   try {
     const { from = '', to = '', cc = '', bcc = '', subject = '', body = '', invoiceId = '' } = req.body;
 
-    if (!from || !allowedFromAddress(from)) {
-      return res.status(400).send('Invalid or unauthorized from address.');
-    }
-    if (!to) return res.status(400).send('Missing to recipients.');
+    if (!from || !allowedFromAddress(from)) return res.status(400).send('Invalid from address.')
+    if (!to) return res.status(400).send('Missing to recipients.')
 
-    // NEW: add stable invoice tag (e.g., [#INV:12345]) so we can match replies
     const taggedSubject = withRefTag(subject, invoiceId);
 
     const message = {
       subject: taggedSubject,
-      body: { contentType: 'Text', content: body || '' }, // change to 'HTML' if you prefer
+      body: { contentType: 'Text', content: body || '' },
       toRecipients: parseEmails(to),
       ccRecipients: parseEmails(cc),
       bccRecipients: parseEmails(bcc),
@@ -304,7 +299,6 @@ app.post('/api/email/send', upload.array('attachments'), async (req, res) => {
       return res.status(resp.status).send(text);
     }
 
-    // (Optional) also persist a note server-side here if you want.
     res.json({ ok: true, sent: true, invoiceId });
   } catch (e) {
     console.error('send error', e);
@@ -312,31 +306,16 @@ app.post('/api/email/send', upload.array('attachments'), async (req, res) => {
   }
 });
 
-
-
-/**
- * PATCH /api/invoices/:id
- * Accepts subset of fields: { status, folder, assigned, ref }
- * Validates status in ('New','Matched','Posting','Completed')
- * Sets last_modified = now()
- */
+// PATCH /api/invoices/:id
 app.patch('/api/invoices/:id', async (req, res) => {
   const { id } = req.params
   const allowed = ['status', 'folder', 'assigned', 'ref']
   const patch = {}
   for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
 
-  // nothing to update
-  if (Object.keys(patch).length === 0) {
-    return res.status(400).json({ error: 'No updatable fields supplied' })
-  }
+  if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'No updatable fields supplied' })
+  if (patch.status && !['New','Matched','Posting','Completed'].includes(patch.status)) return res.status(400).json({ error: 'Invalid status' })
 
-  // validate status
-  if (patch.status && !['New','Matched','Posting','Completed'].includes(patch.status)) {
-    return res.status(400).json({ error: 'Invalid status' })
-  }
-
-  // build dynamic SET clause
   const sets = []
   const vals = []
   let idx = 1
@@ -344,24 +323,22 @@ app.patch('/api/invoices/:id', async (req, res) => {
     sets.push(`${k} = $${idx++}`)
     vals.push(v)
   }
-  // always touch last_modified
   sets.push(`last_modified = now()`)
 
   try {
     const { rows } = await pool.query(
-      `UPDATE invoice SET ${sets.join(', ')} WHERE id = $${idx}
-       RETURNING *`,
+      `UPDATE invoice SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`,
       [...vals, id]
     )
     if (!rows[0]) return res.status(404).json({ error: 'Invoice not found' })
-    res.json(mapInvoiceRow({ ...rows[0], notes: [] })) // notes not joined here
+    res.json(mapInvoiceRow({ ...rows[0], notes: [] }))
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'Failed to update invoice' })
   }
 })
 
-// ---------- Reply ingestion (Graph delta poller) ----------
+// ------------------------- Reply ingestion poller -------------------------
 const REPLY_MAILBOX = (process.env.REPLY_MAILBOX || (process.env.SHARED_MAILBOXES || '').split(',')[0] || '').trim();
 
 function extractInvoiceIdFromSubject(subject='') {
@@ -379,15 +356,13 @@ function stripHtml(html = '') {
     .trim();
 }
 
-// simple once-per-boot schema init
-let REPLY_SCHEMA_READY = false;
+let REPLY_SCHEMA_READY = false
 async function ensureReplySchema() {
   if (REPLY_SCHEMA_READY) return;
   await pool.query(`CREATE TABLE IF NOT EXISTS mailbox_cursor (mailbox TEXT PRIMARY KEY, delta_link TEXT)`);
   await pool.query(`ALTER TABLE note ADD COLUMN IF NOT EXISTS message_id TEXT`);
-  // allow multiple NULLs; dedupe real message ids
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS note_message_id_uidx ON note (message_id)`);
-  REPLY_SCHEMA_READY = true;
+  REPLY_SCHEMA_READY = true
 }
 
 async function loadDeltaLink(mailbox) {
@@ -404,7 +379,7 @@ async function saveDeltaLink(mailbox, link) {
 }
 
 async function pollRepliesOnce() {
-  if (!REPLY_MAILBOX) return; // nothing to poll
+  if (!REPLY_MAILBOX) return;
   try {
     await ensureReplySchema();
 
@@ -459,11 +434,15 @@ async function pollRepliesOnce() {
   }
 }
 
-// kick off the poller
 setInterval(pollRepliesOnce, 60_000);
 pollRepliesOnce();
 
+// ------------------------- Catch-all for React -------------------------
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(__dirname, '../client/build', 'index.html'));
+})
 
+// ------------------------- Start Server -------------------------
 const PORT = process.env.PORT || 5000
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`API listening on http://localhost:${PORT}`)
