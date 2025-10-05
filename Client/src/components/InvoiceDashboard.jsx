@@ -30,7 +30,9 @@ import CloseIcon from "@mui/icons-material/Close";
 import SendIcon from "@mui/icons-material/Send";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000";
+// same-origin in Azure; optional override for local dev
+const API_BASE = (import.meta.env.VITE_API_URL ?? '').trim().replace(/\/+$/, '');
+
 
 const STATUS_OPTIONS = ["New", "Matched", "Posting", "Completed"];
 const FOLDERS = ["UK", "Ireland", "Foreign", "Spain", "GmbH"];
