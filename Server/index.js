@@ -1,42 +1,59 @@
+// Server/index.js
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
+import multer from 'multer'
+import fetch from 'node-fetch'
+import path from 'path'
+import fs from 'fs'
+import { fileURLToPath } from 'url'
 import { pool } from './db.js'
-import multer from 'multer';
-import fetch from 'node-fetch';
-import { ClientSecretCredential } from '@azure/identity';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { ClientSecretCredential } from '@azure/identity'
 import {
   StorageSharedKeyCredential,
   BlobSASPermissions,
   generateBlobSASQueryParameters
 } from '@azure/storage-blob'
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// ESM __dirname
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 const app = express()
-const upload = multer({ limits: { fileSize: 8 * 1024 * 1024 } }); // 8 MB per file
+const upload = multer({ limits: { fileSize: 8 * 1024 * 1024 } }) // 8 MB per file
 
 app.use(express.json())
 
-app.use(cors({
-  origin: ['http://localhost:5173','http://localhost:3000'],
-  credentials: false
-}))
+// ---- CORS (allow localhost + this Azure site automatically) ----
+const azureOrigin = process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : null
+const allowedOrigins = ['http://localhost:5173', 'http://localhost:3000', ...(azureOrigin ? [azureOrigin] : [])]
+app.use(cors({ origin: allowedOrigins, credentials: false }))
 
-// ------------------------- React Frontend -------------------------
-// Serve React static files
-app.use(express.static(path.join(__dirname, '../client/dist')));
+// ---- Optional health check ----
+app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'))
 
-// ------------------------------------------------------------------
+// ------------------------- React Frontend (static) -------------------------
+// (We’ll mount the catch-all **after** API routes so it won’t swallow /api/*)
+const spaCandidates = [
+  path.join(__dirname, '../client/dist'),
+  path.join(__dirname, '../dist'),
+  path.join(__dirname, 'dist'),
+]
+const clientDir = spaCandidates.find(p => fs.existsSync(path.join(p, 'index.html')))
+if (clientDir) {
+  app.use(express.static(clientDir))
+  console.log('Serving SPA from:', clientDir)
+} else {
+  console.log('No SPA build found. Running API-only.')
+}
+
+// ---------------------------------------------------------------------------
 
 // Tag outbound subjects with a stable token we can find in replies
 function withRefTag(subject, invoiceId) {
-  if (!invoiceId) return subject || '';
-  const tag = `[#INV:${invoiceId}]`;
-  return (subject || '').includes(tag) ? subject : `${subject || ''} ${tag}`.trim();
+  if (!invoiceId) return subject || ''
+  const tag = `[#INV:${invoiceId}]`
+  return (subject || '').includes(tag) ? subject : `${subject || ''} ${tag}`.trim()
 }
 
 // 🔹 Azure Blob SAS helpers
@@ -69,12 +86,12 @@ const credential = new ClientSecretCredential(
   process.env.GRAPH_TENANT_ID,
   process.env.GRAPH_CLIENT_ID,
   process.env.GRAPH_CLIENT_SECRET
-);
-const GRAPH_SCOPE = 'https://graph.microsoft.com/.default';
+)
+const GRAPH_SCOPE = 'https://graph.microsoft.com/.default'
 
 async function getGraphToken() {
-  const token = await credential.getToken(GRAPH_SCOPE);
-  return token?.token;
+  const token = await credential.getToken(GRAPH_SCOPE)
+  return token?.token
 }
 
 function parseEmails(str = '') {
@@ -82,16 +99,16 @@ function parseEmails(str = '') {
     .split(/[;,]/)
     .map(s => s.trim())
     .filter(Boolean)
-    .map(address => ({ emailAddress: { address } }));
+    .map(address => ({ emailAddress: { address } }))
 }
 
 function allowedFromAddress(addr) {
   const allowed = (process.env.SHARED_MAILBOXES || '')
     .split(',')
     .map(s => s.trim().toLowerCase())
-    .filter(Boolean);
+    .filter(Boolean)
   if (!allowed.length) return true
-  return allowed.includes(String(addr || '').toLowerCase());
+  return allowed.includes(String(addr || '').toLowerCase())
 }
 
 // Helper: shape invoice row
@@ -190,30 +207,24 @@ app.delete('/api/invoices/:id/notes/:noteId', async (req, res) => {
 
 // DELETE /api/invoices/:id
 app.delete('/api/invoices/:id', async (req, res) => {
-  const { id } = req.params;
+  const { id } = req.params
   try {
-    const result = await pool.query(
-      'DELETE FROM invoice WHERE id = $1 RETURNING id',
-      [id]
-    );
+    const result = await pool.query('DELETE FROM invoice WHERE id = $1 RETURNING id', [id])
     if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Invoice not found' });
+      return res.status(404).json({ error: 'Invoice not found' })
     }
-    return res.status(204).send();
+    return res.status(204).send()
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'Failed to delete invoice' });
+    console.error(e)
+    return res.status(500).json({ error: 'Failed to delete invoice' })
   }
-});
+})
 
 // GET /api/invoices/:id/blob-url
 app.get('/api/invoices/:id/blob-url', async (req, res) => {
   const { id } = req.params
   try {
-    const { rows } = await pool.query(
-      `SELECT bloburl FROM invoice WHERE id = $1`,
-      [id]
-    )
+    const { rows } = await pool.query(`SELECT bloburl FROM invoice WHERE id = $1`, [id])
     const row = rows[0]
     if (!row) return res.status(404).json({ error: 'Invoice not found' })
     if (!row.bloburl) return res.status(400).json({ error: 'bloburl is empty for this invoice' })
@@ -259,12 +270,12 @@ app.get('/api/invoices/:id/blob-url', async (req, res) => {
 // POST /api/email/send
 app.post('/api/email/send', upload.array('attachments'), async (req, res) => {
   try {
-    const { from = '', to = '', cc = '', bcc = '', subject = '', body = '', invoiceId = '' } = req.body;
+    const { from = '', to = '', cc = '', bcc = '', subject = '', body = '', invoiceId = '' } = req.body
 
     if (!from || !allowedFromAddress(from)) return res.status(400).send('Invalid from address.')
     if (!to) return res.status(400).send('Missing to recipients.')
 
-    const taggedSubject = withRefTag(subject, invoiceId);
+    const taggedSubject = withRefTag(subject, invoiceId)
 
     const message = {
       subject: taggedSubject,
@@ -273,7 +284,7 @@ app.post('/api/email/send', upload.array('attachments'), async (req, res) => {
       ccRecipients: parseEmails(cc),
       bccRecipients: parseEmails(bcc),
       attachments: [],
-    };
+    }
 
     for (const file of req.files || []) {
       message.attachments.push({
@@ -281,30 +292,30 @@ app.post('/api/email/send', upload.array('attachments'), async (req, res) => {
         name: file.originalname,
         contentType: file.mimetype || 'application/octet-stream',
         contentBytes: Buffer.from(file.buffer).toString('base64'),
-      });
+      })
     }
 
-    const token = await getGraphToken();
-    if (!token) throw new Error('Failed to acquire Graph token');
+    const token = await getGraphToken()
+    if (!token) throw new Error('Failed to acquire Graph token')
 
-    const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(from)}/sendMail`;
+    const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(from)}/sendMail`
     const resp = await fetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ message, saveToSentItems: true }),
-    });
+    })
 
     if (!resp.ok) {
-      const text = await resp.text();
-      return res.status(resp.status).send(text);
+      const text = await resp.text()
+      return res.status(resp.status).send(text)
     }
 
-    res.json({ ok: true, sent: true, invoiceId });
+    res.json({ ok: true, sent: true, invoiceId })
   } catch (e) {
-    console.error('send error', e);
-    res.status(500).send(e?.message || 'Internal error');
+    console.error('send error', e)
+    res.status(500).send(e?.message || 'Internal error')
   }
-});
+})
 
 // PATCH /api/invoices/:id
 app.patch('/api/invoices/:id', async (req, res) => {
@@ -314,7 +325,9 @@ app.patch('/api/invoices/:id', async (req, res) => {
   for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
 
   if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'No updatable fields supplied' })
-  if (patch.status && !['New','Matched','Posting','Completed'].includes(patch.status)) return res.status(400).json({ error: 'Invalid status' })
+  if (patch.status && !['New', 'Matched', 'Posting', 'Completed'].includes(patch.status)) {
+    return res.status(400).json({ error: 'Invalid status' })
+  }
 
   const sets = []
   const vals = []
@@ -339,11 +352,11 @@ app.patch('/api/invoices/:id', async (req, res) => {
 })
 
 // ------------------------- Reply ingestion poller -------------------------
-const REPLY_MAILBOX = (process.env.REPLY_MAILBOX || (process.env.SHARED_MAILBOXES || '').split(',')[0] || '').trim();
+const REPLY_MAILBOX = (process.env.REPLY_MAILBOX || (process.env.SHARED_MAILBOXES || '').split(',')[0] || '').trim()
 
-function extractInvoiceIdFromSubject(subject='') {
-  const m = subject.match(/\[#INV:(\d+)\]/i);
-  return m ? m[1] : null;
+function extractInvoiceIdFromSubject(subject = '') {
+  const m = subject.match(/\[#INV:(\d+)\]/i)
+  return m ? m[1] : null
 }
 function stripHtml(html = '') {
   return html
@@ -353,21 +366,21 @@ function stripHtml(html = '') {
     .replace(/<\/p>/gi, '\n')
     .replace(/<[^>]+>/g, '')
     .replace(/\u00A0/g, ' ')
-    .trim();
+    .trim()
 }
 
 let REPLY_SCHEMA_READY = false
 async function ensureReplySchema() {
-  if (REPLY_SCHEMA_READY) return;
-  await pool.query(`CREATE TABLE IF NOT EXISTS mailbox_cursor (mailbox TEXT PRIMARY KEY, delta_link TEXT)`);
-  await pool.query(`ALTER TABLE note ADD COLUMN IF NOT EXISTS message_id TEXT`);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS note_message_id_uidx ON note (message_id)`);
+  if (REPLY_SCHEMA_READY) return
+  await pool.query(`CREATE TABLE IF NOT EXISTS mailbox_cursor (mailbox TEXT PRIMARY KEY, delta_link TEXT)`)
+  await pool.query(`ALTER TABLE note ADD COLUMN IF NOT EXISTS message_id TEXT`)
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS note_message_id_uidx ON note (message_id)`)
   REPLY_SCHEMA_READY = true
 }
 
 async function loadDeltaLink(mailbox) {
-  const { rows } = await pool.query(`SELECT delta_link FROM mailbox_cursor WHERE mailbox=$1`, [mailbox]);
-  return rows[0]?.delta_link || null;
+  const { rows } = await pool.query(`SELECT delta_link FROM mailbox_cursor WHERE mailbox=$1`, [mailbox])
+  return rows[0]?.delta_link || null
 }
 async function saveDeltaLink(mailbox, link) {
   await pool.query(
@@ -375,38 +388,39 @@ async function saveDeltaLink(mailbox, link) {
      VALUES ($1,$2)
      ON CONFLICT (mailbox) DO UPDATE SET delta_link=EXCLUDED.delta_link`,
     [mailbox, link]
-  );
+  )
 }
 
 async function pollRepliesOnce() {
-  if (!REPLY_MAILBOX) return;
+  if (!REPLY_MAILBOX) return
   try {
-    await ensureReplySchema();
+    await ensureReplySchema()
 
-    const token = await getGraphToken();
-    const headers = { Authorization: `Bearer ${token}` };
+    const token = await getGraphToken()
+    const headers = { Authorization: `Bearer ${token}` }
 
-    let deltaLink = await loadDeltaLink(REPLY_MAILBOX);
-    let url = deltaLink ||
+    let deltaLink = await loadDeltaLink(REPLY_MAILBOX)
+    let url =
+      deltaLink ||
       `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(REPLY_MAILBOX)}` +
-      `/mailFolders('Inbox')/messages/delta` +
-      `?$select=subject,from,receivedDateTime,body,internetMessageId`;
+        `/mailFolders('Inbox')/messages/delta` +
+        `?$select=subject,from,receivedDateTime,body,internetMessageId`
 
     while (url) {
-      const resp = await fetch(url, { headers });
+      const resp = await fetch(url, { headers })
       if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`Graph delta failed ${resp.status}: ${text}`);
+        const text = await resp.text()
+        throw new Error(`Graph delta failed ${resp.status}: ${text}`)
       }
-      const json = await resp.json();
+      const json = await resp.json()
 
-      for (const m of (json.value || [])) {
-        const invoiceId = extractInvoiceIdFromSubject(m.subject || '');
-        if (!invoiceId) continue;
+      for (const m of json.value || []) {
+        const invoiceId = extractInvoiceIdFromSubject(m.subject || '')
+        if (!invoiceId) continue
 
-        const raw = m?.body?.content || '';
-        const contentType = (m?.body?.contentType || '').toLowerCase();
-        const bodyText = contentType === 'html' ? stripHtml(raw) : raw;
+        const raw = m?.body?.content || ''
+        const contentType = (m?.body?.contentType || '').toLowerCase()
+        const bodyText = contentType === 'html' ? stripHtml(raw) : raw
 
         try {
           await pool.query(
@@ -414,33 +428,47 @@ async function pollRepliesOnce() {
              VALUES ($1, $2, now()::date, $3)
              ON CONFLICT (message_id) DO NOTHING`,
             [invoiceId, bodyText.slice(0, 8000), m.internetMessageId || null]
-          );
+          )
         } catch (e) {
-          console.error('note insert failed', e);
+          console.error('note insert failed', e)
         }
       }
 
       if (json['@odata.nextLink']) {
-        url = json['@odata.nextLink'];
+        url = json['@odata.nextLink']
       } else {
-        deltaLink = json['@odata.deltaLink'] || deltaLink;
-        url = null;
+        deltaLink = json['@odata.deltaLink'] || deltaLink
+        url = null
       }
     }
 
-    if (deltaLink) await saveDeltaLink(REPLY_MAILBOX, deltaLink);
+    if (deltaLink) await saveDeltaLink(REPLY_MAILBOX, deltaLink)
   } catch (e) {
-    console.error('pollRepliesOnce error:', e.message || e);
+    console.error('pollRepliesOnce error:', e?.message || e)
   }
 }
 
-setInterval(pollRepliesOnce, 60_000);
-pollRepliesOnce();
+// Only enable poller if config is complete
+const ENABLE_REPLY_POLLER =
+  !!REPLY_MAILBOX &&
+  !!process.env.GRAPH_TENANT_ID &&
+  !!process.env.GRAPH_CLIENT_ID &&
+  !!process.env.GRAPH_CLIENT_SECRET
 
-// ------------------------- Catch-all for React -------------------------
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(__dirname, '../client/dist', 'index.html'));
-})
+if (ENABLE_REPLY_POLLER) {
+  setInterval(pollRepliesOnce, 60_000)
+  pollRepliesOnce()
+} else {
+  console.log('Reply poller disabled: missing Graph config or REPLY_MAILBOX')
+}
+
+// ------------------------- Catch-all for React (Express 5-safe) -------------------------
+if (clientDir) {
+  // IMPORTANT: this is after API routes so it doesn't intercept /api/*
+  app.get(/^(?!\/api\/).*/, (_req, res) => {
+    res.sendFile(path.join(clientDir, 'index.html'))
+  })
+}
 
 // ------------------------- Start Server -------------------------
 const PORT = process.env.PORT || 5000
