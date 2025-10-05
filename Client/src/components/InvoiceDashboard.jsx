@@ -30,9 +30,15 @@ import CloseIcon from "@mui/icons-material/Close";
 import SendIcon from "@mui/icons-material/Send";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
 
-// same-origin in Azure; optional override for local dev
-const API_BASE = (import.meta.env.VITE_API_URL ?? '').trim().replace(/\/+$/, '');
-
+/* ========= COPY/PASTE FIX =========
+   In production, ignore VITE_API_URL and use same-origin ('').
+   In dev, use VITE_API_URL or fall back to http://localhost:5000.
+*/
+const API_BASE = import.meta.env.PROD
+  ? "" 
+  : (import.meta.env.VITE_API_URL || "http://localhost:5000").trim().replace(/\/+$/, "");
+if (import.meta.env.DEV) console.log("API_BASE ->", API_BASE);
+/* ================================== */
 
 const STATUS_OPTIONS = ["New", "Matched", "Posting", "Completed"];
 const FOLDERS = ["UK", "Ireland", "Foreign", "Spain", "GmbH"];
@@ -636,8 +642,6 @@ function InvoiceDashboard() {
 
       emailFiles.forEach((f, i) => form.append("attachments", f, f.name));
 
-      // Backend should send via Microsoft Graph using the shared mailbox and return a JSON payload
-      // e.g. { id: "<messageId>", bodySaved: "<string to add to notes>" }
       const resp = await fetch(`${API_BASE}/api/email/send`, {
         method: "POST",
         body: form,
