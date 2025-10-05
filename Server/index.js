@@ -1,5 +1,13 @@
 // Server/index.js
-import 'dotenv/config'
+// Load .env only when NOT running on Azure App Service
+if (!process.env.WEBSITE_INSTANCE_ID) {
+  try {
+    await import('dotenv/config');
+  } catch {
+    // dotenv is optional in prod; ignore if not installed
+  }
+}
+
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'

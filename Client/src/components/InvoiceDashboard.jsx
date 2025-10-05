@@ -47,7 +47,7 @@ const ASSIGNEES = ["Allan Perry", "Marcos Silva", "Caroline Stathatos"];
 // Optional: one or more shared mailboxes to send from
 const SHARED_MAILBOXES = (
   import.meta.env.VITE_SHARED_MAILBOXES?.split(",") || [
-    "ap@gear4music.com",
+    "accounts.queries@gear4music.com",
   ]
 ).map((s) => s.trim()).filter(Boolean);
 
