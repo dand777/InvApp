@@ -65,6 +65,29 @@ const formatUKDate = (isoString) => {
   return `${day}-${month}-${year}`;
 };
 
+// Extract unique G-numbers (e.g. G123456) from an array of note objects
+const extractGNumbers = (notes) => {
+  if (!Array.isArray(notes) || notes.length === 0) return [];
+  const rx = /\bG(\d{6})\b/gi;
+  const seen = new Set();
+  const out = [];
+  for (const n of notes) {
+    if (!n || !n.text) continue;
+    let m;
+    while ((m = rx.exec(n.text))) {
+      const g = `G${m[1]}`.toUpperCase();
+      if (!seen.has(g)) {
+        seen.add(g);
+        out.push(g);
+      }
+    }
+  }
+  return out;
+};
+
+// Normalize supplier string for grouping/filtering (trim + case-fold)
+const normalizeSupplier = (s) => String(s || '').trim().toLowerCase();
+
 function SlideUpTransition(props) {
   return <Slide {...props} direction="up" />;
 }
@@ -78,6 +101,9 @@ function ExportMenu({ onExport, selectedCount }) {
       </IconButton>
       <Menu anchorEl={anchor} open={Boolean(anchor)} onClose={() => setAnchor(null)}>
         <MenuItem onClick={() => { setAnchor(null); onExport && onExport(); }}>Export CSV</MenuItem>
+        <MenuItem onClick={() => { setAnchor(null); window.open('https://gear4music.sharepoint.com/sites/Gear4musicIntranetPortal/AIProcessing/Forms/AllItems.aspx', '_blank', 'noopener,noreferrer'); }}>
+          Open Sharepoint
+        </MenuItem>
       </Menu>
     </>
   )
@@ -248,6 +274,7 @@ function ProcessToolbar(props) {
 function InvoiceDashboard() {
   const [rows, setRows] = useState([]);
   const [filterSupplier, setFilterSupplier] = useState(null);
+  const [supplierQuery, setSupplierQuery] = useState('');
 
   const [selectedRow, setSelectedRow] = useState(null);
   const [rowSelectionModel, setRowSelectionModel] = useState([]);
@@ -255,6 +282,7 @@ function InvoiceDashboard() {
   const [selectedNote, setSelectedNote] = useState(null);
   const [noteDialogOpen, setNoteDialogOpen] = useState(false);
   const [noteText, setNoteText] = useState("");
+  const [noteReadOnly, setNoteReadOnly] = useState(false);
 
   // Status column header filter
   const [statusFilter, setStatusFilter] = useState("All");
@@ -262,6 +290,8 @@ function InvoiceDashboard() {
   // New items pop-up
   const [newItemsCount, setNewItemsCount] = useState(0);
   const [snackbarOpen, setSnackbarOpen] = useState(false);
+  const [editDialogOpen, setEditDialogOpen] = useState(false);
+  const [editForm, setEditForm] = useState({ hub: '', folder: FOLDERS[0], assigned: ASSIGNEES[0], ref: '' , status: 'New'});
 
   // Burger menu
   const [menuAnchor, setMenuAnchor] = useState(null);
@@ -312,11 +342,39 @@ function InvoiceDashboard() {
   const [isSending, setIsSending] = useState(false);
 
   const supplierCounts = useMemo(() => {
-    return rows.reduce((acc, row) => {
-      acc[row.supplier] = (acc[row.supplier] || 0) + 1;
-      return acc;
-    }, {});
+    // key: normalized supplier -> { name: displayName, count }
+    const map = {};
+    for (const row of rows) {
+      const raw = row.supplier || '';
+      const key = normalizeSupplier(raw);
+      if (!map[key]) map[key] = { name: raw.trim() || raw, count: 0 };
+      map[key].count += 1;
+    }
+    // Convert to plain object mapping displayName -> count but keep normalized keys available
+    const out = {};
+    for (const [k, v] of Object.entries(map)) {
+      out[k] = { name: v.name, count: v.count };
+    }
+    return out;
   }, [rows]);
+
+  // Detect duplicate rows: same supplier + same invoice number (case-insensitive supplier)
+  const duplicateRowIds = useMemo(() => {
+    const map = new Map();
+    for (const r of rows) {
+      const key = `${normalizeSupplier(r.supplier)}||${String(r.invoiceno || '').trim()}`;
+      const arr = map.get(key) || [];
+      arr.push(r.id);
+      map.set(key, arr);
+    }
+    const dupIds = new Set();
+    for (const arr of map.values()) {
+      if (arr.length > 1) arr.forEach(id => dupIds.add(id));
+    }
+    return dupIds;
+  }, [rows]);
+
+  // (removed supplier-wide G-number summary — G numbers are shown only per-invoice)
 
   // Polling invoices
   useEffect(() => {
@@ -363,7 +421,7 @@ function InvoiceDashboard() {
 
   // Filter + selection sync
   const filteredRows = useMemo(() => {
-    let base = filterSupplier ? rows.filter((r) => r.supplier === filterSupplier) : rows;
+    let base = filterSupplier ? rows.filter((r) => normalizeSupplier(r.supplier) === filterSupplier) : rows;
     if (statusFilter !== "All") {
       if (statusFilter === 'In Query') {
         base = base.filter((r) => Array.isArray(r.notes) && r.notes.length > 0);
@@ -466,10 +524,19 @@ function InvoiceDashboard() {
   };
 
   // Notes
-  const handleOpenNote = (note) => {
+  const handleViewNote = (note) => {
     if (!selectedRow) return;
     setSelectedNote(note);
     setNoteText(note.text);
+    setNoteReadOnly(true);
+    setNoteDialogOpen(true);
+  };
+
+  const handleEditNote = (note) => {
+    if (!selectedRow) return;
+    setSelectedNote(note);
+    setNoteText(note.text);
+    setNoteReadOnly(false);
     setNoteDialogOpen(true);
   };
 
@@ -590,8 +657,23 @@ function InvoiceDashboard() {
   const handleEditSelected = () => {
     const selected = getSelectedRows();
     if (selected.length === 0) return;
-    // No-op for now — but wired up for future.
-    console.log("Edit clicked for rows:", selected.map(r => r.id));
+    // If single row selected, prefill with that row's values
+    if (selected.length === 1) {
+      const r = selected[0];
+      setEditForm({
+        hub: r.hub || '',
+        folder: r.folder || FOLDERS[0],
+        assigned: r.assigned || ASSIGNEES[0],
+        ref: r.ref || '',
+        status: r.status || 'New'
+      });
+      setEditDialogOpen(true);
+      return;
+    }
+
+    // Multiple rows: clear form (user chooses values to apply)
+    setEditForm({ hub: '', folder: FOLDERS[0], assigned: ASSIGNEES[0], ref: '', status: 'New' });
+    setEditDialogOpen(true);
   };
 
   const handleDeleteSelected = async () => {
@@ -737,15 +819,26 @@ function InvoiceDashboard() {
   // Columns (status header dropdown remains)
   const columns = useMemo(
     () => [
-      { field: "supplier", headerName: "Supplier", flex: 1 },
-      { field: "hub", headerName: "Hub", flex: 1 },
-      { field: "type", headerName: "Type", flex: 1 },
+      {
+        field: "supplier",
+        headerName: "Supplier",
+        flex: 1.6,
+        renderCell: (params) => {
+          const supplier = params.value || '';
+          // Only show G-numbers that belong to this invoice (row-local)
+          const rowG = extractGNumbers(params.row.notes || []);
+          const gText = rowG.length ? ` [${rowG.join(', ')}]` : '';
+          return <Typography sx={{ fontSize: 13 }}>{`${supplier}${gText}`}</Typography>;
+        }
+      },
+      { field: "hub", headerName: "Hub", flex: 0.75 },
+      { field: "type", headerName: "Type", flex: 0.75 },
       { field: "invoiceno", headerName: "Invoice No", flex: 1 },
 
       {
         field: "invoice_date",
         headerName: "Invoice Date",
-        flex: 1,
+        flex: 0.6,
         valueGetter: (params) => formatUKDate(params.row.invoice_date),
       },
       { field: "po", headerName: "PO", flex: 1 },
@@ -755,13 +848,13 @@ function InvoiceDashboard() {
       {
         field: "last_modified",
         headerName: "Last Modified",
-        flex: 1,
+        flex: 0.6,
         valueGetter: (params) => formatUKDate(params.row.last_modified),
       },
       {
         field: "created_on",
         headerName: "Created On",
-        flex: 1,
+        flex: 0.6,
         valueGetter: (params) => formatUKDate(params.row.created_on),
       },
       {
@@ -829,6 +922,7 @@ function InvoiceDashboard() {
         <DataGrid
           rows={filteredRows}
           columns={columns}
+          getRowClassName={(params) => (duplicateRowIds.has(params.id) ? 'dup-row' : '')}
           rowHeight={30}
           headerHeight={28}
           density="compact"
@@ -887,6 +981,10 @@ function InvoiceDashboard() {
               display: "flex",
               alignItems: "center",
             },
+            "& .dup-row": {
+              backgroundColor: 'rgba(255,0,0,0.28)',
+              borderLeft: '4px solid rgba(255,0,0,0.6)'
+            },
             "& .MuiDataGrid-row.Mui-selected, .MuiDataGrid-row.Mui-selected:hover": {
               backgroundColor: "rgba(25,118,210,0.2)",
             },
@@ -906,20 +1004,31 @@ function InvoiceDashboard() {
             sx={{ position: "sticky", top: 0, background: "transparent", zIndex: 1, p: 1, pb: 0.5 }}
           >
             <Typography variant="body2" sx={{ fontSize: 18 }}>Suppliers</Typography>
-            <Button size="small" sx={{ fontSize: 14, textTransform: "none" }} onClick={() => setFilterSupplier(null)}>
+            <Button size="small" sx={{ fontSize: 14, textTransform: "none" }} onClick={() => { setFilterSupplier(null); setSupplierQuery(''); }}>
               Show All
             </Button>
           </Box>
           <Box sx={{ overflowY: "auto", height: "calc(100% - 32px)", px: 1 }}>
+            <Box sx={{ px: 0.5, pb: 0.5 }}>
+              <TextField
+                size="small"
+                placeholder="Search suppliers..."
+                value={supplierQuery}
+                onChange={(e) => setSupplierQuery(e.target.value)}
+                fullWidth
+              />
+            </Box>
             <List dense>
-              {Object.entries(supplierCounts).map(([supplier, count]) => (
-                <ListItem key={supplier} button onClick={() => setFilterSupplier(supplier)} sx={{ py: 0.3 }}>
-                  <ListItemText
-                    primaryTypographyProps={{ fontSize: 14, color: "inherit" }}
-                    primary={`${supplier} (${count})`}
-                  />
-                </ListItem>
-              ))}
+              {Object.entries(supplierCounts)
+                .filter(([norm, obj]) => !supplierQuery || obj.name.toLowerCase().includes(supplierQuery.toLowerCase()))
+                .map(([norm, obj]) => (
+                  <ListItem key={norm} button onClick={() => setFilterSupplier(norm)} sx={{ py: 0.3 }}>
+                    <ListItemText
+                      primaryTypographyProps={{ fontSize: 14, color: "inherit" }}
+                      primary={`${obj.name} (${obj.count})`}
+                    />
+                  </ListItem>
+                ))}
             </List>
           </Box>
         </Card>
@@ -932,7 +1041,7 @@ function InvoiceDashboard() {
                 <Button
                   size="small"
                   sx={{ fontSize: 14, textTransform: "none" }}
-                  onClick={() => { setSelectedNote(null); setNoteText(""); setNoteDialogOpen(true); }}
+                  onClick={() => { setSelectedNote(null); setNoteText(""); setNoteReadOnly(false); setNoteDialogOpen(true); }}
                   disabled={!selectedRow}
                 >
                   + Add Note
@@ -955,18 +1064,23 @@ function InvoiceDashboard() {
                 </Button>
               </Box>
             </Box>
-            <List dense>
+                <List dense>
               {selectedRow && Array.isArray(selectedRow.notes) && selectedRow.notes.length > 0 ? (
                 selectedRow.notes.map((note) => (
-                  <ListItem key={note.id} sx={{ py: 0.3, display: "flex", justifyContent: "space-between" }}>
+                  <ListItem
+                    key={note.id}
+                    button
+                    onClick={() => handleViewNote(note)}
+                    sx={{ py: 0.3, display: "flex", alignItems: "center" }}
+                  >
                     <ListItemText
                       primaryTypographyProps={{ fontSize: 14 }}
-                      primary={`${note.text.substring(0, 20)}... (${note.date})`}
-                      onClick={() => handleOpenNote(note)}
+                      sx={{ flex: 1, mr: 1, whiteSpace: 'normal' }}
+                      primary={`${note.text} (${note.date})`}
                     />
                     <Box>
-                      <IconButton size="small" onClick={() => handleOpenNote(note)}><EditIcon fontSize="inherit" /></IconButton>
-                      <IconButton size="small" onClick={() => handleDeleteNote(note.id)}><DeleteIcon fontSize="inherit" /></IconButton>
+                      <IconButton size="small" onClick={(e) => { e.stopPropagation(); handleEditNote(note); }}><EditIcon fontSize="inherit" /></IconButton>
+                      <IconButton size="small" onClick={(e) => { e.stopPropagation(); handleDeleteNote(note.id); }}><DeleteIcon fontSize="inherit" /></IconButton>
                     </Box>
                   </ListItem>
                 ))
@@ -978,10 +1092,68 @@ function InvoiceDashboard() {
         </Card>
       </Box>
 
+      {/* Edit dialog for single or bulk edits */}
+      <Dialog open={editDialogOpen} onClose={() => setEditDialogOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>Edit selected invoice(s)</DialogTitle>
+        <DialogContent>
+          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, mt: 1 }}>
+            <TextField
+              label="Hub"
+              size="small"
+              value={editForm.hub}
+              onChange={(e) => setEditForm(prev => ({ ...prev, hub: e.target.value }))}
+            />
+            <Select size="small" value={editForm.folder} onChange={(e) => setEditForm(prev => ({ ...prev, folder: e.target.value }))}>
+              {FOLDERS.map(f => <MenuItem key={f} value={f}>{f}</MenuItem>)}
+            </Select>
+            <Select size="small" value={editForm.assigned} onChange={(e) => setEditForm(prev => ({ ...prev, assigned: e.target.value }))}>
+              {ASSIGNEES.map(a => <MenuItem key={a} value={a}>{a}</MenuItem>)}
+            </Select>
+            <TextField size="small" label="Ref" value={editForm.ref} onChange={(e) => setEditForm(prev => ({ ...prev, ref: e.target.value.replace(/\D/g,'').slice(0,6) }))} />
+            <Select size="small" value={editForm.status} onChange={(e) => setEditForm(prev => ({ ...prev, status: e.target.value }))}>
+              {STATUS_OPTIONS.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
+            </Select>
+          </Box>
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Note: Only status, folder, assigned and ref are persisted to the server. Hub edits are local/UI-only unless server support is added.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setEditDialogOpen(false)}>Cancel</Button>
+          <Button variant="contained" onClick={async () => {
+            const selected = getSelectedRows();
+            if (!selected.length) return;
+
+            // Build patch object with only allowed fields
+            const allowedPatch = {};
+            if (editForm.status) allowedPatch.status = editForm.status;
+            if (editForm.folder) allowedPatch.folder = editForm.folder;
+            if (editForm.assigned) allowedPatch.assigned = editForm.assigned;
+            if (editForm.ref && /^\d{6}$/.test(editForm.ref)) allowedPatch.ref = editForm.ref;
+
+            // Optimistic UI update
+            setRows(prev => prev.map(r => selected.some(s => s.id === r.id) ? { ...r, ...editForm, ...allowedPatch } : r));
+
+            // Send PATCH requests for each selected row, limited to allowed fields
+            try {
+              await Promise.all(selected.map(s => fetch(`${API_BASE}/api/invoices/${s.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(allowedPatch)
+              })));
+            } catch (e) {
+              console.error('Bulk edit failed', e);
+            }
+
+            setEditDialogOpen(false);
+          }}>Apply</Button>
+        </DialogActions>
+      </Dialog>
+
       {/* Notes editor */}
       <Dialog open={noteDialogOpen} onClose={() => setNoteDialogOpen(false)} fullWidth maxWidth="sm">
         <DialogTitle>
-          {selectedNote ? "Edit Note" : "Add Note"}
+          {selectedNote ? (noteReadOnly ? "View Note" : "Edit Note") : "Add Note"}
           <IconButton
             aria-label="close"
             onClick={() => setNoteDialogOpen(false)}
@@ -1001,6 +1173,7 @@ function InvoiceDashboard() {
               fullWidth
               multiline
               minRows={3}
+              InputProps={{ readOnly: Boolean(noteReadOnly) }}
               placeholder="Type your note..."
               value={noteText}
               onChange={(e) => setNoteText(e.target.value)}
@@ -1009,7 +1182,7 @@ function InvoiceDashboard() {
           )}
         </DialogContent>
         <DialogActions>
-          {selectedNote && (
+          {selectedNote && !noteReadOnly && (
             <Button
               color="error"
               onClick={() => {
@@ -1022,13 +1195,15 @@ function InvoiceDashboard() {
           )}
           <Box sx={{ flex: 1 }} />
           <Button onClick={() => setNoteDialogOpen(false)}>Cancel</Button>
-          <Button
-            variant="contained"
-            onClick={handleSaveNote}
-            disabled={!selectedRow || !noteText.trim()}
-          >
-            Save
-          </Button>
+          {!noteReadOnly && (
+            <Button
+              variant="contained"
+              onClick={handleSaveNote}
+              disabled={!selectedRow || !noteText.trim()}
+            >
+              Save
+            </Button>
+          )}
         </DialogActions>
       </Dialog>
 

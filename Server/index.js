@@ -296,16 +296,26 @@ app.post('/api/email/send', upload.array('attachments'), async (req, res) => {
     if (!from || !allowedFromAddress(from)) return res.status(400).send('Invalid from address.')
     if (!to) return res.status(400).send('Missing to recipients.')
 
-    const taggedSubject = withRefTag(subject, invoiceId)
+  const taggedSubject = withRefTag(subject, invoiceId)
+  console.log('Sending email - original subject:', subject, 'taggedSubject:', taggedSubject, 'invoiceId:', invoiceId)
 
-    const message = {
-      subject: taggedSubject,
-      body: { contentType: 'Text', content: body || '' },
-      toRecipients: parseEmails(to),
-      ccRecipients: parseEmails(cc),
-      bccRecipients: parseEmails(bcc),
-      attachments: [],
-    }
+    // Generate a stable id we can track through replies. Use invoiceId+timestamp to avoid collisions.
+    // Note: Microsoft Graph requires custom internet headers to start with 'X-'.
+    const generatedMessageId = `inv-${invoiceId || 'na'}-${Date.now()}-${Math.floor(Math.random()*10000)}@invapp.local`
+    console.log('Generated X-InvApp-Message-ID for send:', generatedMessageId)
+
+      const message = {
+        subject: taggedSubject,
+        body: { contentType: 'Text', content: body || '' },
+        toRecipients: parseEmails(to),
+        ccRecipients: parseEmails(cc),
+        bccRecipients: parseEmails(bcc),
+        // Add a custom X- header so Graph accepts it. Some mail providers may still remove/modify headers in transit.
+        internetMessageHeaders: [
+          { name: 'X-InvApp-Message-ID', value: generatedMessageId }
+        ],
+        attachments: [],
+      }
 
     for (const file of req.files || []) {
       message.attachments.push({
@@ -331,7 +341,8 @@ app.post('/api/email/send', upload.array('attachments'), async (req, res) => {
       return res.status(resp.status).send(text)
     }
 
-    res.json({ ok: true, sent: true, invoiceId })
+      // Return messageId so caller can persist it if desired
+      res.json({ ok: true, sent: true, invoiceId, messageId: generatedMessageId })
   } catch (e) {
     console.error('send error', e)
     res.status(500).send(e?.message || 'Internal error')
@@ -516,17 +527,20 @@ async function pollRepliesOnce() {
         const invoiceId = extractInvoiceIdFromSubject(m.subject || '')
         if (!invoiceId) continue
 
+        console.log('Reply poller: matched invoiceId from subject', invoiceId, 'messageId:', m.internetMessageId, 'subject:', m.subject)
+
         const raw = m?.body?.content || ''
         const contentType = (m?.body?.contentType || '').toLowerCase()
         const bodyText = contentType === 'html' ? stripHtml(raw) : raw
 
         try {
-          await pool.query(
+          const res = await pool.query(
             `INSERT INTO note (invoice_id, text, date, message_id)
              VALUES ($1, $2, now()::date, $3)
              ON CONFLICT (message_id) DO NOTHING`,
             [invoiceId, bodyText.slice(0, 8000), m.internetMessageId || null]
           )
+          if (res && res.rowCount) console.log('Inserted reply as note for invoice', invoiceId, 'messageId:', m.internetMessageId)
         } catch (e) {
           console.error('note insert failed', e)
         }
