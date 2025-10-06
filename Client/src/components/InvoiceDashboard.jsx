@@ -284,6 +284,7 @@ function InvoiceDashboard() {
   const [noteDialogOpen, setNoteDialogOpen] = useState(false);
   const [noteText, setNoteText] = useState("");
   const [noteReadOnly, setNoteReadOnly] = useState(false);
+  const [deleteDialog, setDeleteDialog] = useState({ open: false, ids: [], message: '' });
 
   // Status column header filter
   const [statusFilter, setStatusFilter] = useState("All");
@@ -682,32 +683,43 @@ function InvoiceDashboard() {
     setEditDialogOpen(true);
   };
 
-  const handleDeleteSelected = async () => {
+  const handleDeleteSelected = () => {
     const selected = getSelectedRows();
     if (selected.length === 0) return;
 
-    const msg =
+    const message =
       selected.length === 1
         ? `Delete invoice ${selected[0].id}?`
         : `Delete ${selected.length} selected invoices?`;
-    if (!window.confirm(msg)) return;
 
-    // Optimistic removal
     const ids = selected.map(r => r.id);
+    setDeleteDialog({ open: true, ids, message });
+  };
+
+  const cancelDeleteSelected = () => {
+    setDeleteDialog({ open: false, ids: [], message: '' });
+  };
+
+  const confirmDeleteSelected = async () => {
+    const ids = deleteDialog.ids;
+    if (!ids.length) {
+      cancelDeleteSelected();
+      return;
+    }
+
     setRows(prev => prev.filter(r => !ids.includes(r.id)));
-    // Clear selection after delete
     setRowSelectionModel([]);
 
-    // Try API deletes in the background — if unsupported, UI still updates.
+    cancelDeleteSelected();
+
     try {
       await Promise.allSettled(
         ids.map(id =>
-          fetch(`${API_BASE}/api/invoices/${id}`, { method: "DELETE" })
+          fetch(`${API_BASE}/api/invoices/${id}`, { method: 'DELETE' })
         )
       );
     } catch (e) {
-      console.error("Delete error:", e);
-      // (Optional) You could refetch here if you want to re-sync.
+      console.error('Delete error:', e);
     }
   };
   /** ------------------------------------------------------- */
@@ -1311,6 +1323,28 @@ function InvoiceDashboard() {
         </DialogActions>
       </Dialog>
 
+      {/* Delete confirmation */}
+      <Dialog open={deleteDialog.open} onClose={cancelDeleteSelected}>
+        <DialogTitle>
+          Delete {deleteDialog.ids.length > 1 ? 'invoices' : 'invoice'}
+        </DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ mt: 0.5 }}>
+            {deleteDialog.message}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={cancelDeleteSelected}>Cancel</Button>
+          <Button
+            onClick={confirmDeleteSelected}
+            variant="contained"
+            color="error"
+          >
+            Delete
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       {/* NEW: Outlook-like email compose */}
       <Dialog open={emailDialogOpen} onClose={() => setEmailDialogOpen(false)} fullWidth maxWidth="md">
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -1468,7 +1502,7 @@ function InvoiceDashboard() {
         TransitionComponent={SlideUpTransition}
         message={`${newItemsCount} new item(s) added`}
         ContentProps={{
-          sx: { backgroundColor: "#1976d2", color: "#fff", fontSize: 10, width: 250, maxWidth: "100%" },
+          sx: { backgroundColor: "#1976d2", color: "#fff", fontSize: 16, width: 250, maxWidth: "100%" },
         }}
       />
       <Snackbar
