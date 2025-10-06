@@ -1,13 +1,6 @@
 // Server/index.js
-// Load .env only when NOT running on Azure App Service
-if (!process.env.WEBSITE_INSTANCE_ID) {
-  try {
-    await import('dotenv/config');
-  } catch {
-    // dotenv is optional in prod; ignore if not installed
-  }
-}
-
+// Load .env only when NOT running on Azure App Service (use explicit path)
+import dotenv from 'dotenv'
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'
@@ -15,7 +8,6 @@ import fetch from 'node-fetch'
 import path from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
-import { pool } from './db.js'
 import { ClientSecretCredential } from '@azure/identity'
 import {
   StorageSharedKeyCredential,
@@ -27,10 +19,31 @@ import {
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
+// Load local .env (only when not running inside Azure App Service)
+if (!process.env.WEBSITE_INSTANCE_ID) {
+  try {
+    const envPath = path.join(__dirname, '.env')
+    dotenv.config({ path: envPath })
+    console.log('.env loaded from', envPath)
+  } catch (e) {
+    console.error('Failed to load .env (ignored in prod):', e && e.message ? e.message : e)
+  }
+}
+
 const app = express()
 const upload = multer({ limits: { fileSize: 8 * 1024 * 1024 } }) // 8 MB per file
 
 app.use(express.json())
+
+// Import DB after dotenv runs so the pool can read DATABASE_URL / PG* vars
+let pool
+try {
+  const dbModule = await import('./db.js')
+  pool = dbModule.pool
+} catch (e) {
+  console.error('Failed to initialize database pool:', e && e.message ? e.message : e)
+  throw e
+}
 
 // ---- CORS (allow localhost + this Azure site automatically) ----
 const azureOrigin = process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : null
@@ -358,6 +371,65 @@ app.patch('/api/invoices/:id', async (req, res) => {
     res.status(500).json({ error: 'Failed to update invoice' })
   }
 })
+
+// GET /api/invoices/export?ids=1,2,3
+app.get('/api/invoices/export', async (req, res) => {
+  try {
+    const idsParam = req.query.ids;
+    let rowsResult;
+    if (idsParam) {
+      const ids = String(idsParam).split(',').map((s) => parseInt(s, 10)).filter(Boolean);
+      if (ids.length === 0) return res.status(400).send('No valid ids supplied');
+      const { rows } = await pool.query(
+        `SELECT i.*, COALESCE(
+           json_agg(
+             json_build_object('id', n.id, 'text', n.text, 'date', to_char(n.date, 'YYYY-MM-DD'))
+           ) FILTER (WHERE n.id IS NOT NULL), '[]') AS notes
+         FROM invoice i
+         LEFT JOIN note n ON n.invoice_id = i.id
+         WHERE i.id = ANY($1::int[])
+         GROUP BY i.id
+         ORDER BY i.created_on DESC`,
+        [ids]
+      );
+      rowsResult = rows.map(mapInvoiceRow);
+    } else {
+      const { rows } = await pool.query(`
+        SELECT i.*,
+               COALESCE(
+                 json_agg(
+                   json_build_object('id', n.id, 'text', n.text, 'date', to_char(n.date, 'YYYY-MM-DD'))
+                 ) FILTER (WHERE n.id IS NOT NULL), '[]'
+               ) AS notes
+        FROM invoice i
+        LEFT JOIN note n ON n.invoice_id = i.id
+        GROUP BY i.id
+        ORDER BY i.created_on DESC;
+      `);
+      rowsResult = rows.map(mapInvoiceRow);
+    }
+
+    const fields = ['id','supplier','hub','type','invoiceno','invoice_date','po','folder','assigned','ref','last_modified','created_on','status'];
+    const escape = (v) => {
+      if (v === null || v === undefined) return '';
+      const s = typeof v === 'string' ? v : String(v);
+      return '"' + s.replace(/"/g, '""') + '"';
+    };
+
+    const lines = [];
+    lines.push(fields.join(','));
+    for (const r of rowsResult) {
+      lines.push(fields.map((f) => escape(r[f])).join(','));
+    }
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="invoices-${new Date().toISOString().slice(0,10)}.csv"`);
+    res.send(lines.join('\n'));
+  } catch (e) {
+    console.error('export error', e);
+    res.status(500).send('Export failed');
+  }
+});
 
 // ------------------------- Reply ingestion poller -------------------------
 const REPLY_MAILBOX =

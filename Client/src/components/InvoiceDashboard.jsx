@@ -17,6 +17,7 @@ import {
   Snackbar,
   Select,
   MenuItem,
+  Menu,
   Slide,
   Chip,
   Tooltip,
@@ -29,6 +30,8 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import CloseIcon from "@mui/icons-material/Close";
 import SendIcon from "@mui/icons-material/Send";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
+import ContentPasteSearchIcon from '@mui/icons-material/ContentPasteSearch';
+import MenuIcon from '@mui/icons-material/Menu';
 
 /* ========= COPY/PASTE FIX =========
    In production, ignore VITE_API_URL and use same-origin ('').
@@ -40,7 +43,7 @@ const API_BASE = import.meta.env.PROD
 if (import.meta.env.DEV) console.log("API_BASE ->", API_BASE);
 /* ================================== */
 
-const STATUS_OPTIONS = ["New", "Matched", "Posting", "Completed"];
+const STATUS_OPTIONS = ["New", "Matched", "Posting", "Completed", "In Query"];
 const FOLDERS = ["UK", "Ireland", "Foreign", "Spain", "GmbH"];
 const ASSIGNEES = ["Allan Perry", "Marcos Silva", "Caroline Stathatos"];
 
@@ -64,6 +67,20 @@ const formatUKDate = (isoString) => {
 
 function SlideUpTransition(props) {
   return <Slide {...props} direction="up" />;
+}
+
+function ExportMenu({ onExport, selectedCount }) {
+  const [anchor, setAnchor] = useState(null);
+  return (
+    <>
+      <IconButton size="small" onClick={(e) => setAnchor(e.currentTarget)}>
+        <MenuIcon />
+      </IconButton>
+      <Menu anchorEl={anchor} open={Boolean(anchor)} onClose={() => setAnchor(null)}>
+        <MenuItem onClick={() => { setAnchor(null); onExport && onExport(); }}>Export CSV</MenuItem>
+      </Menu>
+    </>
+  )
 }
 
 /** Thin connector line between pills — now colourable & fill-aware */
@@ -136,6 +153,8 @@ function ProcessToolbar(props) {
     onOpenSelected,
     onEditSelected,
     onDeleteSelected,
+    // export handler
+    onExport,
   } = props;
 
   // helper: connector fills once we've reached the *right-hand* step
@@ -217,6 +236,10 @@ function ProcessToolbar(props) {
         >
           Delete
         </Button>
+        {/* Burger menu (to the right of Delete) */}
+        <Box>
+          <ExportMenu onExport={onExport} selectedCount={selectedCount} />
+        </Box>
       </Box>
     </Box>
   );
@@ -239,6 +262,31 @@ function InvoiceDashboard() {
   // New items pop-up
   const [newItemsCount, setNewItemsCount] = useState(0);
   const [snackbarOpen, setSnackbarOpen] = useState(false);
+
+  // Burger menu
+  const [menuAnchor, setMenuAnchor] = useState(null);
+  const openMenu = (e) => setMenuAnchor(e.currentTarget);
+  const closeMenu = () => setMenuAnchor(null);
+
+  const downloadCsv = (rowsToExport) => {
+    if (!rowsToExport || !rowsToExport.length) return;
+    const fields = ['id','supplier','hub','type','invoiceno','invoice_date','po','folder','assigned','ref','last_modified','created_on','status'];
+    const csv = [fields.join(',')].concat(rowsToExport.map(r => {
+      return fields.map(f => {
+        const v = r[f];
+        if (v === null || v === undefined) return '';
+        return String(v).replace(/"/g,'""');
+      }).map(x => `"${x}"`).join(',')
+    })).join('\n');
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `invoices-${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
 
   const prevIdsRef = useRef(new Set());
 
@@ -317,7 +365,11 @@ function InvoiceDashboard() {
   const filteredRows = useMemo(() => {
     let base = filterSupplier ? rows.filter((r) => r.supplier === filterSupplier) : rows;
     if (statusFilter !== "All") {
-      base = base.filter((r) => (r.status || "New") === statusFilter);
+      if (statusFilter === 'In Query') {
+        base = base.filter((r) => Array.isArray(r.notes) && r.notes.length > 0);
+      } else {
+        base = base.filter((r) => (r.status || "New") === statusFilter);
+      }
     }
     return base;
   }, [rows, filterSupplier, statusFilter]);
@@ -717,6 +769,9 @@ function InvoiceDashboard() {
         headerName: "Status",
         flex: 1,
         valueGetter: (params) => params.row.status || "New",
+        renderCell: (params) => {
+          return <Typography sx={{ fontSize: 13 }}>{params.value}</Typography>
+        },
         renderHeader: () => (
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <Typography variant="caption" sx={{ fontWeight: 600 }}>
@@ -743,6 +798,21 @@ function InvoiceDashboard() {
           </Box>
         ),
       },
+      {
+        field: 'in_query',
+        headerName: '',
+        width: 48,
+        sortable: false,
+        filterable: false,
+        align: 'center',
+        headerAlign: 'center',
+        renderCell: (params) => {
+          const hasNotes = Array.isArray(params.row.notes) && params.row.notes.length > 0;
+          return hasNotes ? (
+            <ContentPasteSearchIcon sx={{ color: 'error.main', fontSize: 18 }} />
+          ) : null
+        }
+      },
     ],
     [statusFilter]
   );
@@ -752,6 +822,7 @@ function InvoiceDashboard() {
       <Typography variant="h5" gutterBottom>
         Invoice Manager
       </Typography>
+      {/* top-right menu removed — menu is now inside the DataGrid toolbar */}
 
       {/* DataGrid with custom toolbar */}
       <Box sx={{ flexGrow: 1, minHeight: 0 }}>
@@ -788,6 +859,23 @@ function InvoiceDashboard() {
               onOpenSelected: handleOpenSelected,
               onEditSelected: handleEditSelected,
               onDeleteSelected: handleDeleteSelected,
+              onExport: async () => {
+                const ids = rowSelectionModel.length ? rowSelectionModel.join(',') : '';
+                const url = ids ? `${API_BASE}/api/invoices/export?ids=${ids}` : `${API_BASE}/api/invoices/export`;
+                try {
+                  const resp = await fetch(url);
+                  if (!resp.ok) throw new Error(await resp.text());
+                  const blob = await resp.blob();
+                  const dlUrl = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = dlUrl;
+                  a.download = `invoices-${new Date().toISOString().slice(0,10)}.csv`;
+                  a.click();
+                  URL.revokeObjectURL(dlUrl);
+                } catch (e) {
+                  alert('Export failed: ' + (e?.message || e));
+                }
+              }
             },
           }}
           sx={{
@@ -852,9 +940,14 @@ function InvoiceDashboard() {
                 {/* NEW: Email button next to + Add Note */}
                 <Button
                   size="small"
-                  variant="contained"
                   startIcon={<SendIcon fontSize="small" />}
-                  sx={{ fontSize: 14, textTransform: "none" }}
+                  sx={{
+                    fontSize: 14,
+                    textTransform: "none",
+                    // keep the icon compact so the button visually matches the + Add Note button
+                    '& .MuiButton-startIcon': { mr: 0.5 },
+                    px: 1.5,
+                  }}
                   onClick={openEmailComposer}
                   disabled={!selectedRow}
                 >
@@ -1045,18 +1138,6 @@ function InvoiceDashboard() {
             <Typography variant="caption" color="text.secondary">From shared mailbox</Typography>
           </Box>
           <Box sx={{ flex: 1 }} />
-          <Tooltip title="Send">
-            <span>
-              <Button
-                onClick={handleSendEmail}
-                startIcon={<SendIcon />}
-                variant="contained"
-                disabled={isSending}
-              >
-                {isSending ? 'Sending…' : 'Send'}
-              </Button>
-            </span>
-          </Tooltip>
           <IconButton aria-label="close" onClick={() => setEmailDialogOpen(false)}>
             <CloseIcon />
           </IconButton>
