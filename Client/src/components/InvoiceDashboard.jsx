@@ -23,6 +23,7 @@ import {
   Tooltip,
   Divider,
   InputAdornment,
+  Autocomplete,
 } from "@mui/material";
 import { DataGrid, GridToolbarQuickFilter } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
@@ -340,6 +341,11 @@ function InvoiceDashboard() {
   const [emailBody, setEmailBody] = useState("");
   const [emailFiles, setEmailFiles] = useState([]); // File[]
   const [isSending, setIsSending] = useState(false);
+  // For people search autocomplete
+  const [peopleOptions, setPeopleOptions] = useState([]);
+  // keep lastTerm, abort controller and debounce timer in a ref
+  const peopleFetchRef = useRef({ lastTerm: '', abort: null, timer: null });
+  const [peopleSearchError, setPeopleSearchError] = useState(null);
 
   const supplierCounts = useMemo(() => {
     // key: normalized supplier -> { name: displayName, count }
@@ -1327,18 +1333,81 @@ function InvoiceDashboard() {
             </Select>
 
             <Typography variant="body2" sx={{ alignSelf: 'center' }}>To</Typography>
-            <TextField
-              size="small"
-              placeholder="recipient@example.com; another@domain.com"
-              value={emailTo}
-              onChange={(e) => setEmailTo(e.target.value)}
-              InputProps={{
-                endAdornment: (
-                  <InputAdornment position="end">
-                    <Typography variant="caption" color="text.secondary">semicolon separated</Typography>
-                  </InputAdornment>
-                ),
+            <Autocomplete
+              freeSolo
+              multiple
+              options={peopleOptions}
+              getOptionLabel={(opt) => (typeof opt === 'string' ? opt : `${opt.name} <${opt.email}>`) }
+              filterOptions={(x) => x}
+              value={parseEmailList(emailTo)}
+              onChange={(_e, value) => {
+                // value can be array of strings or {name,email}
+                setEmailTo(value.map(v => (typeof v === 'string' ? v : v.email || v)).join('; '));
               }}
+              onInputChange={(_e, input, _reason) => {
+                const term = (input || '').trim();
+
+                // clear any pending timer
+                if (peopleFetchRef.current.timer) {
+                  clearTimeout(peopleFetchRef.current.timer);
+                  peopleFetchRef.current.timer = null;
+                }
+
+                // If input is empty, clear options and abort pending requests
+                if (!term) {
+                  setPeopleOptions([]);
+                  peopleFetchRef.current.lastTerm = '';
+                  if (peopleFetchRef.current.abort) {
+                    try { peopleFetchRef.current.abort.abort(); } catch {};
+                    peopleFetchRef.current.abort = null;
+                  }
+                  return;
+                }
+
+                // debounce network calls by 300ms
+                peopleFetchRef.current.timer = setTimeout(async () => {
+                  try {
+                    // allow single-letter searches (term.length >= 1)
+                    if (peopleFetchRef.current.lastTerm === term) return;
+                    peopleFetchRef.current.lastTerm = term;
+
+                    if (peopleFetchRef.current.abort) {
+                      try { peopleFetchRef.current.abort.abort(); } catch {};
+                    }
+                    const controller = new AbortController();
+                    peopleFetchRef.current.abort = controller;
+
+                    const resp = await fetch(`${API_BASE}/api/graph/people?q=${encodeURIComponent(term)}`, { signal: controller.signal });
+                    if (!resp.ok) {
+                      const txt = await resp.text();
+                      throw new Error(txt || 'People search failed');
+                    }
+                    const json = await resp.json();
+                    setPeopleOptions(json || []);
+                    // DEBUG: show fetched results in console to inspect
+                    try { console.debug('peopleOptions set ->', json); } catch {}
+                  } catch (err) {
+                    if (err.name === 'AbortError') return;
+                    setPeopleSearchError(err?.message || 'People search failed');
+                  }
+                }, 300);
+              }}
+              renderInput={(params) => (
+                <TextField
+                  {...params}
+                  size="small"
+                  placeholder="recipient@example.com; another@domain.com or search by name"
+                  InputProps={{
+                    ...params.InputProps,
+                    endAdornment: (
+                      <InputAdornment position="end">
+                        <Typography variant="caption" color="text.secondary">semicolon separated</Typography>
+                      </InputAdornment>
+                    ),
+                  }}
+                />
+              )}
+              sx={{ minWidth: 320 }}
             />
 
             <Typography variant="body2" sx={{ alignSelf: 'center' }}>Cc</Typography>
@@ -1402,6 +1471,13 @@ function InvoiceDashboard() {
           sx: { backgroundColor: "#1976d2", color: "#fff", fontSize: 10, width: 250, maxWidth: "100%" },
         }}
       />
+      <Snackbar
+        open={Boolean(peopleSearchError)}
+        autoHideDuration={5000}
+        onClose={() => setPeopleSearchError(null)}
+        message={peopleSearchError || ''}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
+      />
     </Box>
   );
 }
@@ -1417,4 +1493,21 @@ function useCallbackIdsToRows(rowSelectionModel, rows) {
     const setIds = new Set(rowSelectionModel);
     return refRows.current.filter(r => setIds.has(r.id));
   };
+}
+
+/**
+ * Parse a semicolon-separated email list into array for Autocomplete value.
+ * Accepts strings like "Alice <a@x.com>; bob@x.com" or plain emails.
+ */
+function parseEmailList(s) {
+  if (!s) return [];
+  return String(s)
+    .split(/;+/)
+    .map(x => x.trim())
+    .filter(Boolean)
+    .map(item => {
+      const m = item.match(/^(.*)\s*<([^>]+)>$/);
+      if (m) return { name: m[1].trim(), email: m[2].trim() };
+      return item;
+    });
 }

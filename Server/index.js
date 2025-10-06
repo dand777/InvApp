@@ -442,6 +442,60 @@ app.get('/api/invoices/export', async (req, res) => {
   }
 });
 
+// GET /api/graph/people?q=term  -- simple people search for the client
+app.get('/api/graph/people', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json([]);
+  try {
+    const token = await getGraphToken();
+    if (!token) return res.status(500).json({ error: 'Graph token unavailable' });
+
+  // Request a larger page of users and filter server-side for simplicity.
+  // Increasing $top helps single-letter searches by returning more candidates.
+  const url = `https://graph.microsoft.com/v1.0/users?$select=displayName,mail,userPrincipalName&$top=999`;
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!resp.ok) {
+      // Try to surface a friendly message for common authorization failures
+      let bodyText = await resp.text();
+      try {
+        const parsed = JSON.parse(bodyText);
+        const code = parsed?.error?.code;
+        const message = parsed?.error?.message || bodyText;
+        if (code === 'Authorization_RequestDenied' || code === 'InsufficientPrivileges') {
+          console.warn('Graph people search authorization denied:', message);
+          return res.status(403).json({ error: 'GraphInsufficientPrivileges', message: 'Insufficient Graph privileges to search users.' });
+        }
+      } catch (e) {
+        // ignore parse errors
+      }
+      return res.status(resp.status).send(bodyText);
+    }
+    const json = await resp.json();
+    const term = String(q || '').trim().toLowerCase();
+    const seen = new Set();
+    const out = [];
+    for (const u of (json.value || [])) {
+      const name = String(u.displayName || '').trim();
+      const mail = String(u.mail || u.userPrincipalName || '').trim();
+      if (!mail) continue;
+      const nameLower = name.toLowerCase();
+      const mailLower = mail.toLowerCase();
+      // match if term appears anywhere in name or email
+      if ((term && (nameLower.includes(term) || mailLower.includes(term)))) {
+        if (!seen.has(mailLower)) {
+          seen.add(mailLower);
+          out.push({ name, email: mail });
+        }
+      }
+    }
+    console.log(`People search for '${q}' returned ${out.length} candidates (scanned ${ (json.value||[]).length })`);
+    res.json(out.slice(0, 25));
+  } catch (e) {
+    console.error('people search error', e && e.message ? e.message : e);
+    res.status(500).json({ error: 'People search failed' });
+  }
+});
+
 // ------------------------- Reply ingestion poller -------------------------
 const REPLY_MAILBOX =
   (process.env.REPLY_MAILBOX ||
