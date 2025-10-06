@@ -1,14 +1,16 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { MsalProvider } from "@azure/msal-react";
 import App from "./App";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
 import CssBaseline from "@mui/material/CssBaseline";
+import { msalInstance } from "./authConfig";
 
 const darkTheme = createTheme({
   palette: {
     mode: "dark",
-    primary: { main: "#1e88e5" }, // Deep blue
-    secondary: { main: "#f50057" }, // Pink accent
+    primary: { main: "#1e88e5" },
+    secondary: { main: "#f50057" },
     background: {
       default: "#121212",
       paper: "#1e1e2f",
@@ -55,9 +57,27 @@ const darkTheme = createTheme({
   },
 });
 
-ReactDOM.createRoot(document.getElementById("root")).render(
-  <ThemeProvider theme={darkTheme}>
-    <CssBaseline />
-    <App />
-  </ThemeProvider>
-);
+const container = document.getElementById("root");
+
+function renderApp() {
+  if (!container) return;
+
+  ReactDOM.createRoot(container).render(
+    <MsalProvider instance={msalInstance}>
+      <ThemeProvider theme={darkTheme}>
+        <CssBaseline />
+        <App />
+      </ThemeProvider>
+    </MsalProvider>
+  );
+}
+
+msalInstance
+  .initialize()
+  .then(renderApp)
+  .catch((error) => {
+    if (import.meta.env.DEV) {
+      console.error("MSAL initialization failed", error);
+    }
+    renderApp();
+  });
